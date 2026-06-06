@@ -45,7 +45,7 @@ class MealAnalysis(BaseModel):
 @app.get("/")
 def home():
     return {
-        "status": "Backend Gemini dziala - extended nutrition v2",
+        "status": "Backend Gemini dziala - extended nutrition v3 mikroelementy",
         "model": GEMINI_MODEL,
         "keys": len(GEMINI_API_KEYS),
     }
@@ -82,6 +82,10 @@ def to_float(value, default=0.0):
             value = value.lower()
             value = value.replace("g", "")
             value = value.replace("kcal", "")
+            value = value.replace("mg", "")
+            value = value.replace("µg", "")
+            value = value.replace("ug", "")
+            value = value.replace("mcg", "")
             value = value.replace(",", ".")
             value = value.strip()
 
@@ -92,6 +96,102 @@ def to_float(value, default=0.0):
 
 def to_int(value, default=0):
     return int(round(to_float(value, default)))
+
+
+MICRO_KEYS = [
+    "Rozpuszczalne w tłuszczach / Witamina A [µg]",
+    "Rozpuszczalne w tłuszczach / Witamina D [µg]",
+    "Rozpuszczalne w tłuszczach / Witamina E [mg]",
+    "Rozpuszczalne w tłuszczach / Witamina K [µg]",
+    "Rozpuszczalne w wodzie / Witamina C [mg]",
+    "Witaminy z grupy B / B1 Tiamina [mg]",
+    "Witaminy z grupy B / B2 Ryboflawina [mg]",
+    "Witaminy z grupy B / B3 Niacyna/PP [mg]",
+    "Witaminy z grupy B / B5 Kwas pantotenowy [mg]",
+    "Witaminy z grupy B / B6 Pirydoksyna [mg]",
+    "Witaminy z grupy B / B7 Biotyna [µg]",
+    "Witaminy z grupy B / B9 Kwas foliowy [µg]",
+    "Witaminy z grupy B / B12 Kobalamina [µg]",
+    "Makroelementy / Wapń [mg]",
+    "Makroelementy / Fosfor [mg]",
+    "Makroelementy / Magnez [mg]",
+    "Makroelementy / Potas [mg]",
+    "Makroelementy / Sód [mg]",
+    "Makroelementy / Chlor [mg]",
+    "Makroelementy / Siarka [mg]",
+    "Mikroelementy / Żelazo [mg]",
+    "Mikroelementy / Cynk [mg]",
+    "Mikroelementy / Miedź [mg]",
+    "Mikroelementy / Mangan [mg]",
+    "Mikroelementy / Jod [µg]",
+    "Mikroelementy / Selen [µg]",
+    "Mikroelementy / Fluor [mg]",
+    "Mikroelementy / Chrom [µg]",
+    "Mikroelementy / Molibden [µg]",
+]
+
+
+def empty_micro_map() -> dict:
+    return {key: 0 for key in MICRO_KEYS}
+
+
+def normalize_micro_nutrients(raw_value) -> dict:
+    micros = empty_micro_map()
+
+    if isinstance(raw_value, dict):
+        for key, value in raw_value.items():
+            key_text = str(key).strip()
+            number = to_float(value, 0)
+            if key_text:
+                micros[key_text] = number
+
+    elif isinstance(raw_value, list):
+        for item in raw_value:
+            if isinstance(item, dict):
+                name = str(item.get("name") or item.get("label") or item.get("key") or "").strip()
+                unit = str(item.get("unit") or "").strip()
+                value = to_float(item.get("value") or item.get("amount") or item.get("amount_per_100"), 0)
+                if name:
+                    final_key = name if not unit else f"{name} [{unit}]"
+                    micros[final_key] = value
+
+    return micros
+
+
+def morele_micro_fallback() -> dict:
+    micros = empty_micro_map()
+    micros.update({
+        "Rozpuszczalne w tłuszczach / Witamina A [µg]": 96,
+        "Rozpuszczalne w tłuszczach / Witamina D [µg]": 0,
+        "Rozpuszczalne w tłuszczach / Witamina E [mg]": 0.89,
+        "Rozpuszczalne w tłuszczach / Witamina K [µg]": 3.3,
+        "Rozpuszczalne w wodzie / Witamina C [mg]": 10,
+        "Witaminy z grupy B / B1 Tiamina [mg]": 0.03,
+        "Witaminy z grupy B / B2 Ryboflawina [mg]": 0.04,
+        "Witaminy z grupy B / B3 Niacyna/PP [mg]": 0.6,
+        "Witaminy z grupy B / B5 Kwas pantotenowy [mg]": 0.24,
+        "Witaminy z grupy B / B6 Pirydoksyna [mg]": 0.05,
+        "Witaminy z grupy B / B7 Biotyna [µg]": 0.3,
+        "Witaminy z grupy B / B9 Kwas foliowy [µg]": 9,
+        "Witaminy z grupy B / B12 Kobalamina [µg]": 0,
+        "Makroelementy / Wapń [mg]": 13,
+        "Makroelementy / Fosfor [mg]": 23,
+        "Makroelementy / Magnez [mg]": 10,
+        "Makroelementy / Potas [mg]": 259,
+        "Makroelementy / Sód [mg]": 1,
+        "Makroelementy / Chlor [mg]": 2,
+        "Makroelementy / Siarka [mg]": 6,
+        "Mikroelementy / Żelazo [mg]": 0.39,
+        "Mikroelementy / Cynk [mg]": 0.2,
+        "Mikroelementy / Miedź [mg]": 0.08,
+        "Mikroelementy / Mangan [mg]": 0.08,
+        "Mikroelementy / Jod [µg]": 1,
+        "Mikroelementy / Selen [µg]": 0.1,
+        "Mikroelementy / Fluor [mg]": 0.001,
+        "Mikroelementy / Chrom [µg]": 1,
+        "Mikroelementy / Molibden [µg]": 1,
+    })
+    return micros
 
 
 def apply_extra_fallbacks(result_json: dict) -> dict:
@@ -105,8 +205,33 @@ def apply_extra_fallbacks(result_json: dict) -> dict:
     fiber = to_float(result_json.get("fiber"), 0)
     salt = to_float(result_json.get("salt"), 0)
 
-    name = str(result_json.get("name", "Posiłek")).lower()
+    name_raw = str(result_json.get("name", "Posiłek"))
+    name = name_raw.lower()
     note = str(result_json.get("note", ""))
+
+    raw_micros = (
+        result_json.get("microNutrients")
+        or result_json.get("micro_nutrients")
+        or result_json.get("micronutrients")
+        or result_json.get("vitaminsAndMinerals")
+        or result_json.get("vitamins_minerals")
+        or {}
+    )
+
+    micro_nutrients = normalize_micro_nutrients(raw_micros)
+
+    if ("morele" in name or "morela" in name or "apricot" in name) and all(to_float(v, 0) == 0 for v in micro_nutrients.values()):
+        micro_nutrients = morele_micro_fallback()
+
+    additives = (
+        result_json.get("additives")
+        or result_json.get("emulsifiers")
+        or result_json.get("emulgatory")
+        or []
+    )
+
+    if not isinstance(additives, list):
+        additives = []
 
     if saturated_fat <= 0 and fat > 0:
         if any(word in name for word in ["ser", "pizza", "burger", "mięso", "mieso", "sos", "makaron", "lasagne", "zapiekanka"]):
@@ -115,7 +240,7 @@ def apply_extra_fallbacks(result_json: dict) -> dict:
             saturated_fat = round(fat * 0.20, 1)
 
     if fiber <= 0 and carbs > 15:
-        if any(word in name for word in ["makaron", "pieczywo", "chleb", "płatki", "platki", "owsianka", "warzywa", "ryż", "ryz"]):
+        if any(word in name for word in ["makaron", "pieczywo", "chleb", "płatki", "platki", "owsianka", "warzywa", "ryż", "ryz", "morele", "morela"]):
             fiber = round(carbs * 0.07, 1)
         else:
             fiber = round(carbs * 0.04, 1)
@@ -136,7 +261,7 @@ def apply_extra_fallbacks(result_json: dict) -> dict:
         note = "Dodatkowe wartości mogły zostać oszacowane, jeśli nie były widoczne na etykiecie."
 
     return {
-        "name": result_json.get("name", "Posiłek"),
+        "name": name_raw,
         "calories": calories,
         "protein": protein,
         "carbs": carbs,
@@ -147,6 +272,8 @@ def apply_extra_fallbacks(result_json: dict) -> dict:
         "salt": float(salt),
         "confidence": float(to_float(result_json.get("confidence"), 0)),
         "note": note,
+        "microNutrients": micro_nutrients,
+        "additives": additives,
     }
 
 
@@ -186,14 +313,57 @@ Format:
   "fiber": liczba_gramow_blonnika,
   "salt": liczba_gramow_soli,
   "confidence": liczba_od_0_do_1,
-  "note": "krótka uwaga po polsku"
+  "note": "krótka uwaga po polsku",
+  "microNutrients": {{
+    "Rozpuszczalne w tłuszczach / Witamina A [µg]": liczba,
+    "Rozpuszczalne w tłuszczach / Witamina D [µg]": liczba,
+    "Rozpuszczalne w tłuszczach / Witamina E [mg]": liczba,
+    "Rozpuszczalne w tłuszczach / Witamina K [µg]": liczba,
+    "Rozpuszczalne w wodzie / Witamina C [mg]": liczba,
+    "Witaminy z grupy B / B1 Tiamina [mg]": liczba,
+    "Witaminy z grupy B / B2 Ryboflawina [mg]": liczba,
+    "Witaminy z grupy B / B3 Niacyna/PP [mg]": liczba,
+    "Witaminy z grupy B / B5 Kwas pantotenowy [mg]": liczba,
+    "Witaminy z grupy B / B6 Pirydoksyna [mg]": liczba,
+    "Witaminy z grupy B / B7 Biotyna [µg]": liczba,
+    "Witaminy z grupy B / B9 Kwas foliowy [µg]": liczba,
+    "Witaminy z grupy B / B12 Kobalamina [µg]": liczba,
+    "Makroelementy / Wapń [mg]": liczba,
+    "Makroelementy / Fosfor [mg]": liczba,
+    "Makroelementy / Magnez [mg]": liczba,
+    "Makroelementy / Potas [mg]": liczba,
+    "Makroelementy / Sód [mg]": liczba,
+    "Makroelementy / Chlor [mg]": liczba,
+    "Makroelementy / Siarka [mg]": liczba,
+    "Mikroelementy / Żelazo [mg]": liczba,
+    "Mikroelementy / Cynk [mg]": liczba,
+    "Mikroelementy / Miedź [mg]": liczba,
+    "Mikroelementy / Mangan [mg]": liczba,
+    "Mikroelementy / Jod [µg]": liczba,
+    "Mikroelementy / Selen [µg]": liczba,
+    "Mikroelementy / Fluor [mg]": liczba,
+    "Mikroelementy / Chrom [µg]": liczba,
+    "Mikroelementy / Molibden [µg]": liczba
+  }},
+  "additives": [
+    {{
+      "name": "nazwa dodatku",
+      "code": "E471",
+      "category": "Emulgator / dodatek",
+      "riskLevel": 2,
+      "note": "krótki opis"
+    }}
+  ]
 }}
 
 Bardzo ważne:
 - Jeśli widzisz tabelę wartości odżywczych, użyj jej jako głównego źródła.
 - Jeśli użytkownik podał ilość porcji, przelicz wartości na zjedzoną ilość.
-- Jeśli nie widzisz tabeli, oszacuj wszystkie wartości, także saturated_fat, fiber i salt.
-- Nie zwracaj 0 dla saturated_fat, fiber albo salt, jeśli wartość prawdopodobnie nie jest zerowa.
+- Jeśli użytkownik pyta o składnik na 100 g, zwróć wartości na 100 g.
+- Jeśli nie widzisz tabeli, oszacuj wszystkie wartości, także saturated_fat, fiber, salt oraz microNutrients.
+- Nie zwracaj pustego microNutrients dla owoców, warzyw, mięsa, nabiału, pieczywa, pizzy, gotowych dań i produktów.
+- Dla Morele / Morela / Apricot koniecznie zwróć witaminy i minerały typowe dla świeżych moreli na 100 g.
+- Jeżeli dany produkt realnie nie ma konkretnej witaminy/minerału, wpisz 0.
 - Sól podawaj jako gramy soli, nie jako sód.
 - Cukier oznacza "w tym cukry".
 - Tłuszcze nasycone oznaczają "w tym kwasy tłuszczowe nasycone".
@@ -249,6 +419,8 @@ Bardzo ważne:
                 "salt": 0,
                 "confidence": 0,
                 "note": "Backend Gemini złapał błąd podczas analizy zdjęcia.",
+                "microNutrients": empty_micro_map(),
+                "additives": [],
             }
 
     return {
@@ -264,4 +436,6 @@ Bardzo ważne:
         "salt": 0,
         "confidence": 0,
         "note": "Wszystkie klucze API przekroczyły limit. Spróbuj później albo użyj kluczy z innego projektu Google.",
+        "microNutrients": empty_micro_map(),
+        "additives": [],
     }
