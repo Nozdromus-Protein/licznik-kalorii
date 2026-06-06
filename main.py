@@ -1,5 +1,7 @@
+import asyncio
 import json
 import os
+import re
 from typing import Optional
 
 from fastapi import FastAPI, File, UploadFile, Form
@@ -25,7 +27,17 @@ GEMINI_API_KEYS = [
     if key.strip()
 ]
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODELS = [
+    model.strip()
+    for model in os.environ.get(
+        "GEMINI_MODELS",
+        os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    ).split(",")
+    if model.strip()
+]
+
+if not GEMINI_MODELS:
+    GEMINI_MODELS = ["gemini-2.5-flash"]
 
 
 class MealAnalysis(BaseModel):
@@ -45,8 +57,8 @@ class MealAnalysis(BaseModel):
 @app.get("/")
 def home():
     return {
-        "status": "Backend Gemini dziala - extended nutrition v3 mikroelementy",
-        "model": GEMINI_MODEL,
+        "status": "Backend Gemini dziala - extended nutrition v4 modele fallback",
+        "models": GEMINI_MODELS,
         "keys": len(GEMINI_API_KEYS),
     }
 
@@ -58,7 +70,7 @@ def get_client(index: int):
 
 
 def clean_json_text(text: str) -> str:
-    result = text.strip()
+    result = (text or "").strip()
 
     if result.startswith("```json"):
         result = result.replace("```json", "").replace("```", "").strip()
@@ -79,15 +91,11 @@ def to_float(value, default=0.0):
             return default
 
         if isinstance(value, str):
-            value = value.lower()
-            value = value.replace("g", "")
-            value = value.replace("kcal", "")
-            value = value.replace("mg", "")
-            value = value.replace("µg", "")
-            value = value.replace("ug", "")
-            value = value.replace("mcg", "")
-            value = value.replace(",", ".")
-            value = value.strip()
+            text = value.lower().replace(",", ".").strip()
+            match = re.search(r"-?\d+(?:\.\d+)?", text)
+            if not match:
+                return default
+            return float(match.group(0))
 
         return float(value)
     except Exception:
@@ -376,56 +384,86 @@ Bardzo ważne:
 
     last_error = None
 
-    for index in range(len(GEMINI_API_KEYS)):
-        try:
-            current_client = get_client(index)
+    for model_name in GEMINI_MODELS:
+        model_unavailable = False
 
-            response = current_client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=[
-                    prompt,
-                    image_part,
-                ],
-            )
+        for index in range(len(GEMINI_API_KEYS)):
+            try:
+                current_client = get_client(index)
 
-            result_text = clean_json_text(response.text)
-            print(f"ODPOWIEDZ GEMINI KLUCZ {index + 1}:", result_text)
+                response = current_client.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        prompt,
+                        image_part,
+                    ],
+                )
 
-            result_json = json.loads(result_text)
-            final_result = apply_extra_fallbacks(result_json)
+                result_text = clean_json_text(response.text or "")
+                print(f"ODPOWIEDZ GEMINI MODEL {model_name} KLUCZ {index + 1}:", result_text)
 
-            print("FINALNY WYNIK:", final_result)
+                result_json = json.loads(result_text)
+                final_result = apply_extra_fallbacks(result_json)
 
-            return final_result
+                print("FINALNY WYNIK:", final_result)
 
-        except Exception as error:
-            error_text = str(error)
-            last_error = error_text
-            print(f"BLAD GEMINI KLUCZ {index + 1}:", error_text)
+                return final_result
 
-            if "429" in error_text or "quota" in error_text.lower() or "rate" in error_text.lower() or "resource_exhausted" in error_text.lower():
-                continue
+            except Exception as error:
+                error_text = str(error)
+                error_lower = error_text.lower()
+                last_error = error_text
 
-            return {
-                "error": error_text,
-                "name": "Błąd analizy",
-                "calories": 0,
-                "protein": 0,
-                "carbs": 0,
-                "sugar": 0,
-                "fat": 0,
-                "saturated_fat": 0,
-                "fiber": 0,
-                "salt": 0,
-                "confidence": 0,
-                "note": "Backend Gemini złapał błąd podczas analizy zdjęcia.",
-                "microNutrients": empty_micro_map(),
-                "additives": [],
-            }
+                print(f"BLAD GEMINI MODEL {model_name} KLUCZ {index + 1}:", error_text)
+
+                is_503 = (
+                    "503" in error_text
+                    or "unavailable" in error_lower
+                    or "high demand" in error_lower
+                    or "overloaded" in error_lower
+                    or "try again later" in error_lower
+                )
+
+                is_429 = (
+                    "429" in error_text
+                    or "quota" in error_lower
+                    or "rate" in error_lower
+                    or "resource_exhausted" in error_lower
+                )
+
+                if is_503:
+                    print(f"MODEL {model_name} jest przeciążony. Przełączam na kolejny model.")
+                    model_unavailable = True
+                    await asyncio.sleep(1.2)
+                    break
+
+                if is_429:
+                    print(f"KLUCZ {index + 1} ma limit/quota. Próba kolejnego klucza.")
+                    continue
+
+                return {
+                    "error": error_text,
+                    "name": "Błąd analizy",
+                    "calories": 0,
+                    "protein": 0,
+                    "carbs": 0,
+                    "sugar": 0,
+                    "fat": 0,
+                    "saturated_fat": 0,
+                    "fiber": 0,
+                    "salt": 0,
+                    "confidence": 0,
+                    "note": "Backend Gemini złapał błąd podczas analizy zdjęcia.",
+                    "microNutrients": empty_micro_map(),
+                    "additives": [],
+                }
+
+        if model_unavailable:
+            continue
 
     return {
-        "error": f"Wszystkie klucze Gemini zwróciły 429/quota. Ostatni błąd: {last_error}",
-        "name": "Limit Gemini",
+        "error": f"Wszystkie modele/klucze Gemini zwróciły błąd. Ostatni błąd: {last_error}",
+        "name": "Limit lub przeciążenie Gemini",
         "calories": 0,
         "protein": 0,
         "carbs": 0,
@@ -435,7 +473,7 @@ Bardzo ważne:
         "fiber": 0,
         "salt": 0,
         "confidence": 0,
-        "note": "Wszystkie klucze API przekroczyły limit. Spróbuj później albo użyj kluczy z innego projektu Google.",
+        "note": "Gemini jest przeciążone albo wszystkie klucze przekroczyły limit. Spróbuj ponownie za chwilę.",
         "microNutrients": empty_micro_map(),
         "additives": [],
     }
