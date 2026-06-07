@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import re
@@ -8,6 +9,7 @@ from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
+from openai import OpenAI
 from pydantic import BaseModel
 
 
@@ -20,6 +22,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini").strip().lower()
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini").strip()
 
 GEMINI_API_KEYS = [
     key.strip()
@@ -57,16 +64,25 @@ class MealAnalysis(BaseModel):
 @app.get("/")
 def home():
     return {
-        "status": "Backend Gemini dziala - extended nutrition v4 modele fallback",
-        "models": GEMINI_MODELS,
-        "keys": len(GEMINI_API_KEYS),
+        "status": "Backend AI dziala - OpenAI/Gemini nutrition v5",
+        "provider": AI_PROVIDER,
+        "openai_model": OPENAI_MODEL,
+        "gemini_models": GEMINI_MODELS,
+        "gemini_keys": len(GEMINI_API_KEYS),
+        "openai_key": bool(OPENAI_API_KEY),
     }
 
 
-def get_client(index: int):
+def get_gemini_client(index: int):
     if not GEMINI_API_KEYS:
         raise RuntimeError("Brak GEMINI_API_KEYS albo GEMINI_API_KEY w Render Environment")
     return genai.Client(api_key=GEMINI_API_KEYS[index % len(GEMINI_API_KEYS)])
+
+
+def get_openai_client():
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Brak OPENAI_API_KEY w Render Environment")
+    return OpenAI(api_key=OPENAI_API_KEY)
 
 
 def clean_json_text(text: str) -> str:
@@ -278,30 +294,15 @@ def apply_extra_fallbacks(result_json: dict) -> dict:
         "saturated_fat": float(saturated_fat),
         "fiber": float(fiber),
         "salt": float(salt),
-        "confidence": float(to_float(result_json.get("confidence"), 0)),
+        "confidence": float(to_float(result_json.get("confidence"), 0.8)),
         "note": note,
         "microNutrients": micro_nutrients,
         "additives": additives,
     }
 
 
-@app.post("/analyze-meal")
-async def analyze_meal(
-    file: UploadFile = File(...),
-    description: str = Form("")
-):
-    image_bytes = await file.read()
-
-    mime_type = "image/jpeg"
-
-    if image_bytes.startswith(b"\x89PNG"):
-        mime_type = "image/png"
-    elif image_bytes.startswith(b"\xff\xd8\xff"):
-        mime_type = "image/jpeg"
-    elif image_bytes.startswith(b"RIFF") and b"WEBP" in image_bytes[:20]:
-        mime_type = "image/webp"
-
-    prompt = f"""
+def build_prompt(description: str) -> str:
+    return f"""
 Przeanalizuj zdjęcie posiłku, produktu albo opakowania i oszacuj wartości odżywcze.
 
 Dodatkowy opis od użytkownika:
@@ -377,6 +378,72 @@ Bardzo ważne:
 - Tłuszcze nasycone oznaczają "w tym kwasy tłuszczowe nasycone".
 """
 
+
+def get_mime_type(image_bytes: bytes) -> str:
+    mime_type = "image/jpeg"
+
+    if image_bytes.startswith(b"\x89PNG"):
+        mime_type = "image/png"
+    elif image_bytes.startswith(b"\xff\xd8\xff"):
+        mime_type = "image/jpeg"
+    elif image_bytes.startswith(b"RIFF") and b"WEBP" in image_bytes[:20]:
+        mime_type = "image/webp"
+
+    return mime_type
+
+
+async def analyze_with_openai(prompt: str, image_bytes: bytes, mime_type: str) -> dict:
+    client = get_openai_client()
+
+    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+    image_url = f"data:{mime_type};base64,{image_base64}"
+
+    response = client.responses.create(
+        model=OPENAI_MODEL,
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": prompt,
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": image_url,
+                    },
+                ],
+            }
+        ],
+        max_output_tokens=5000,
+    )
+
+    result_text = getattr(response, "output_text", "") or ""
+
+    if not result_text:
+        try:
+            chunks = []
+            for item in response.output:
+                for content in item.content:
+                    if hasattr(content, "text"):
+                        chunks.append(content.text)
+            result_text = "\n".join(chunks)
+        except Exception:
+            result_text = ""
+
+    result_text = clean_json_text(result_text)
+    print("ODPOWIEDZ OPENAI:", result_text)
+
+    result_json = json.loads(result_text)
+    final_result = apply_extra_fallbacks(result_json)
+    final_result["aiProvider"] = "openai"
+    final_result["aiModel"] = OPENAI_MODEL
+
+    print("FINALNY WYNIK OPENAI:", final_result)
+    return final_result
+
+
+async def analyze_with_gemini(prompt: str, image_bytes: bytes, mime_type: str) -> dict:
     image_part = types.Part.from_bytes(
         data=image_bytes,
         mime_type=mime_type,
@@ -389,7 +456,7 @@ Bardzo ważne:
 
         for index in range(len(GEMINI_API_KEYS)):
             try:
-                current_client = get_client(index)
+                current_client = get_gemini_client(index)
 
                 response = current_client.models.generate_content(
                     model=model_name,
@@ -404,8 +471,10 @@ Bardzo ważne:
 
                 result_json = json.loads(result_text)
                 final_result = apply_extra_fallbacks(result_json)
+                final_result["aiProvider"] = "gemini"
+                final_result["aiModel"] = model_name
 
-                print("FINALNY WYNIK:", final_result)
+                print("FINALNY WYNIK GEMINI:", final_result)
 
                 return final_result
 
@@ -441,29 +510,18 @@ Bardzo ważne:
                     print(f"KLUCZ {index + 1} ma limit/quota. Próba kolejnego klucza.")
                     continue
 
-                return {
-                    "error": error_text,
-                    "name": "Błąd analizy",
-                    "calories": 0,
-                    "protein": 0,
-                    "carbs": 0,
-                    "sugar": 0,
-                    "fat": 0,
-                    "saturated_fat": 0,
-                    "fiber": 0,
-                    "salt": 0,
-                    "confidence": 0,
-                    "note": "Backend Gemini złapał błąd podczas analizy zdjęcia.",
-                    "microNutrients": empty_micro_map(),
-                    "additives": [],
-                }
+                raise RuntimeError(error_text)
 
         if model_unavailable:
             continue
 
+    raise RuntimeError(f"Wszystkie modele/klucze Gemini zwróciły błąd. Ostatni błąd: {last_error}")
+
+
+def error_result(name: str, error_text: str, note: str) -> dict:
     return {
-        "error": f"Wszystkie modele/klucze Gemini zwróciły błąd. Ostatni błąd: {last_error}",
-        "name": "Limit lub przeciążenie Gemini",
+        "error": error_text,
+        "name": name,
         "calories": 0,
         "protein": 0,
         "carbs": 0,
@@ -473,7 +531,54 @@ Bardzo ważne:
         "fiber": 0,
         "salt": 0,
         "confidence": 0,
-        "note": "Gemini jest przeciążone albo wszystkie klucze przekroczyły limit. Spróbuj ponownie za chwilę.",
+        "note": note,
         "microNutrients": empty_micro_map(),
         "additives": [],
     }
+
+
+@app.post("/analyze-meal")
+async def analyze_meal(
+    file: UploadFile = File(...),
+    description: str = Form("")
+):
+    image_bytes = await file.read()
+    mime_type = get_mime_type(image_bytes)
+    prompt = build_prompt(description)
+
+    try:
+        if AI_PROVIDER == "openai":
+            return await analyze_with_openai(prompt, image_bytes, mime_type)
+
+        if AI_PROVIDER == "gemini":
+            return await analyze_with_gemini(prompt, image_bytes, mime_type)
+
+        if AI_PROVIDER == "openai_then_gemini":
+            try:
+                return await analyze_with_openai(prompt, image_bytes, mime_type)
+            except Exception as openai_error:
+                print("OPENAI PADLO, PROBUJE GEMINI:", openai_error)
+                return await analyze_with_gemini(prompt, image_bytes, mime_type)
+
+        if AI_PROVIDER == "gemini_then_openai":
+            try:
+                return await analyze_with_gemini(prompt, image_bytes, mime_type)
+            except Exception as gemini_error:
+                print("GEMINI PADLO, PROBUJE OPENAI:", gemini_error)
+                return await analyze_with_openai(prompt, image_bytes, mime_type)
+
+        return error_result(
+            "Błąd konfiguracji",
+            f"Nieznany AI_PROVIDER: {AI_PROVIDER}",
+            "Ustaw w Render AI_PROVIDER=openai albo AI_PROVIDER=gemini.",
+        )
+
+    except Exception as error:
+        error_text = str(error)
+        print("BLAD ANALIZY AI:", error_text)
+
+        return error_result(
+            "Błąd analizy",
+            error_text,
+            "Backend złapał błąd podczas analizy zdjęcia. Sprawdź Logs w Render albo popraw konfigurację API.",
+        )
