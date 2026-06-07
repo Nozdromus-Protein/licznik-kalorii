@@ -64,8 +64,8 @@ class MealAnalysis(BaseModel):
 @app.get("/")
 def home():
     return {
-        "status": "Backend AI dziala - OpenAI/Gemini nutrition v5",
-        "provider": AI_PROVIDER,
+        "status": "Backend AI dziala - OpenAI/Gemini nutrition v6 provider per request",
+        "default_provider": AI_PROVIDER,
         "openai_model": OPENAI_MODEL,
         "gemini_models": GEMINI_MODELS,
         "gemini_keys": len(GEMINI_API_KEYS),
@@ -366,6 +366,9 @@ Format:
 }}
 
 Bardzo ważne:
+- Analizuj tylko posiłek, produkt albo opakowanie jako całość.
+- Nie zwracaj listy ingredients.
+- Nie rozbijaj posiłku na składniki, chyba że użytkownik wyraźnie opisze porcję i trzeba oszacować całość.
 - Jeśli widzisz tabelę wartości odżywczych, użyj jej jako głównego źródła.
 - Jeśli użytkownik podał ilość porcji, przelicz wartości na zjedzoną ilość.
 - Jeśli użytkownik pyta o składnik na 100 g, zwróć wartości na 100 g.
@@ -540,27 +543,34 @@ def error_result(name: str, error_text: str, note: str) -> dict:
 @app.post("/analyze-meal")
 async def analyze_meal(
     file: UploadFile = File(...),
-    description: str = Form("")
+    description: str = Form(""),
+    ai_provider: Optional[str] = Form(None),
+    provider: Optional[str] = Form(None),
 ):
     image_bytes = await file.read()
     mime_type = get_mime_type(image_bytes)
     prompt = build_prompt(description)
 
+    selected_provider = (ai_provider or provider or AI_PROVIDER).strip().lower()
+
     try:
-        if AI_PROVIDER == "openai":
+        if selected_provider == "openai":
             return await analyze_with_openai(prompt, image_bytes, mime_type)
 
-        if AI_PROVIDER == "gemini":
+        if selected_provider == "gpt":
+            return await analyze_with_openai(prompt, image_bytes, mime_type)
+
+        if selected_provider == "gemini":
             return await analyze_with_gemini(prompt, image_bytes, mime_type)
 
-        if AI_PROVIDER == "openai_then_gemini":
+        if selected_provider == "openai_then_gemini":
             try:
                 return await analyze_with_openai(prompt, image_bytes, mime_type)
             except Exception as openai_error:
                 print("OPENAI PADLO, PROBUJE GEMINI:", openai_error)
                 return await analyze_with_gemini(prompt, image_bytes, mime_type)
 
-        if AI_PROVIDER == "gemini_then_openai":
+        if selected_provider == "gemini_then_openai":
             try:
                 return await analyze_with_gemini(prompt, image_bytes, mime_type)
             except Exception as gemini_error:
@@ -569,8 +579,8 @@ async def analyze_meal(
 
         return error_result(
             "Błąd konfiguracji",
-            f"Nieznany AI_PROVIDER: {AI_PROVIDER}",
-            "Ustaw w Render AI_PROVIDER=openai albo AI_PROVIDER=gemini.",
+            f"Nieznany provider AI: {selected_provider}",
+            "Ustaw provider jako openai, gpt albo gemini.",
         )
 
     except Exception as error:
