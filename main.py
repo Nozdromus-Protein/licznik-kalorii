@@ -5,7 +5,8 @@ import os
 import re
 from typing import Optional
 
-from fastapi import FastAPI, File, UploadFile, Form
+import requests
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
@@ -284,7 +285,7 @@ def apply_extra_fallbacks(result_json: dict) -> dict:
     else:
         note = "Dodatkowe wartości mogły zostać oszacowane, jeśli nie były widoczne na etykiecie."
 
-    return {
+    result = {
         "name": name_raw,
         "calories": calories,
         "protein": protein,
@@ -299,6 +300,16 @@ def apply_extra_fallbacks(result_json: dict) -> dict:
         "microNutrients": micro_nutrients,
         "additives": additives,
     }
+
+    # Dodatkowe pola z odpowiedzi AI (pantry_category, brand, barcode,
+    # search_queries, portion_grams...) przechodza do klienta - prosza o nie
+    # prompty FoodRadar (kategoria produktu, import przez obraz). Pola
+    # wyliczone wyzej maja pierwszenstwo.
+    for key, value in result_json.items():
+        if key not in result:
+            result[key] = value
+
+    return result
 
 
 def build_prompt(description: str) -> str:
@@ -592,3 +603,273 @@ async def analyze_meal(
             error_text,
             "Backend złapał błąd podczas analizy zdjęcia. Sprawdź Logs w Render albo popraw konfigurację API.",
         )
+
+
+# ============================================================================
+# Wspolne API ekosystemu (FoodRadar + Kalorie + Trainer): /v1/...
+# Klucze API zyja WYLACZNIE tutaj (zmienne srodowiskowe Render), nigdy
+# w aplikacjach. Kazdy endpoint zwraca czysty JSON o stalym kontrakcie.
+# ============================================================================
+
+
+def generate_text_json(prompt: str) -> dict:
+    """Tekstowe zapytanie do Gemini (bez obrazu) z ta sama rotacja modeli
+    i kluczy co analiza posilkow. Zwraca zdekodowany JSON."""
+    last_error = None
+    for model_name in GEMINI_MODELS:
+        for index in range(len(GEMINI_API_KEYS)):
+            try:
+                response = get_gemini_client(index).models.generate_content(
+                    model=model_name,
+                    contents=[prompt],
+                )
+                return json.loads(clean_json_text(response.text or ""))
+            except Exception as error:
+                last_error = str(error)
+                print(f"BLAD TEXT-JSON MODEL {model_name} KLUCZ {index + 1}:", last_error)
+                continue
+    raise RuntimeError(f"Wszystkie modele/klucze Gemini zwrocily blad: {last_error}")
+
+
+class TranslateRequest(BaseModel):
+    text: str
+    target: str
+    source: str = ""
+
+
+# Prosta pamiec tlumaczen w procesie - ogranicza zapytania do Google.
+_translation_cache: dict = {}
+
+
+@app.post("/v1/translate")
+def translate(body: TranslateRequest):
+    api_key = os.environ.get("GOOGLE_TRANSLATOR_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Tlumaczenia niedostepne: brak GOOGLE_TRANSLATOR_API_KEY.",
+        )
+    text = body.text.strip()
+    target = body.target.strip().lower()
+    if not text or not target:
+        raise HTTPException(status_code=400, detail="Podaj text i target.")
+    if len(text) > 2000:
+        raise HTTPException(status_code=400, detail="Tekst za dlugi (max 2000).")
+
+    cache_key = f"{target}|{body.source}|{text.lower()}"
+    cached = _translation_cache.get(cache_key)
+    if cached is not None:
+        return {"translation": cached, "cached": True}
+
+    payload = {"q": text, "target": target, "format": "text"}
+    if body.source.strip():
+        payload["source"] = body.source.strip().lower()
+    response = requests.post(
+        "https://translation.googleapis.com/language/translate/v2",
+        params={"key": api_key},
+        json=payload,
+        timeout=12,
+    )
+    if response.status_code != 200:
+        print("BLAD GOOGLE TRANSLATE:", response.status_code, response.text[:300])
+        raise HTTPException(
+            status_code=502,
+            detail=f"Google Translate zwrocil {response.status_code}.",
+        )
+    data = response.json()
+    try:
+        translation = data["data"]["translations"][0]["translatedText"]
+    except (KeyError, IndexError):
+        raise HTTPException(status_code=502, detail="Niepoprawna odpowiedz Google.")
+
+    if len(_translation_cache) > 5000:
+        _translation_cache.clear()
+    _translation_cache[cache_key] = translation
+    return {"translation": translation, "cached": False}
+
+
+@app.get("/v1/prices/barcode/{gtin}")
+def prices_by_barcode(gtin: str):
+    """Realne ceny produktu po kodzie z Open Prices (otwarte API spolecznosci
+    Open Food Facts) - bez klucza. Zwracamy tylko to, co zrodlo potwierdza."""
+    code = "".join(ch for ch in gtin if ch.isdigit())
+    if len(code) < 8:
+        raise HTTPException(status_code=400, detail="Za krotki kod GTIN.")
+    response = requests.get(
+        "https://prices.openfoodfacts.org/api/v1/prices",
+        params={"product_code": code, "size": 20, "order_by": "-date"},
+        headers={"User-Agent": "FoodRadar-ecosystem-backend/1.0"},
+        timeout=12,
+    )
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Open Prices zwrocil {response.status_code}.",
+        )
+    items = response.json().get("items", [])
+    offers = []
+    for item in items:
+        price = item.get("price")
+        if price is None:
+            continue
+        location = item.get("location") or {}
+        offers.append({
+            "store": location.get("osm_name") or "Sklep?",
+            "address": ", ".join(
+                part for part in [
+                    location.get("osm_address_city"),
+                    location.get("osm_address_country"),
+                ] if part
+            ),
+            "latitude": location.get("osm_lat") or 0,
+            "longitude": location.get("osm_lon") or 0,
+            "price": float(price),
+            "currency": item.get("currency") or "",
+            "date": item.get("date") or "",
+            "source": "Open Prices",
+        })
+    return {"gtin": code, "offers": offers, "source": "Open Prices"}
+
+
+class PriceEstimateRequest(BaseModel):
+    name: str
+    country: str = "Polska"
+
+
+@app.post("/v1/prices/estimate")
+def estimate_price(body: PriceEstimateRequest):
+    """SZACUNEK ceny skladnika/produktu przez AI - zawsze jawnie oznaczony
+    estimate=true. Aplikacja pokazuje go jako orientacyjny, nigdy jako
+    potwierdzona cene sklepowa."""
+    name = body.name.strip()
+    if len(name) < 2:
+        raise HTTPException(status_code=400, detail="Podaj nazwe produktu.")
+    prompt = f"""
+Oszacuj typowa cene detaliczna produktu spozywczego w kraju: {body.country}.
+Produkt: {name}
+Zwroc WYLACZNIE poprawny JSON bez markdown:
+{{
+  "price_low": typowa_najnizsza_cena_liczba,
+  "price_high": typowa_najwyzsza_cena_liczba,
+  "currency": "waluta np. zl / EUR",
+  "package": "typowe opakowanie np. 1 kg / 500 g / sztuka",
+  "note": "krotka uwaga po polsku"
+}}
+Jesli nie potrafisz sensownie oszacowac, zwroc price_low i price_high = 0.
+"""
+    try:
+        data = generate_text_json(prompt)
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=str(error))
+    return {
+        "name": name,
+        "estimate": True,
+        "price_low": to_float(data.get("price_low"), 0),
+        "price_high": to_float(data.get("price_high"), 0),
+        "currency": str(data.get("currency", "zl")),
+        "package": str(data.get("package", "")),
+        "note": str(data.get("note", "")),
+        "source": "szacunek AI",
+    }
+
+
+class RecipeGenerateRequest(BaseModel):
+    description: str
+    servings: int = 2
+    meal_type: str = ""
+
+
+@app.post("/v1/recipes/generate")
+def generate_recipe(body: RecipeGenerateRequest):
+    """Generowanie przepisu przez AI - osobny kontrakt JSON (nie schemat
+    posilku z /analyze-meal). Zrodlo w aplikacji oznaczane jako AI."""
+    description = body.description.strip()
+    if len(description) < 3:
+        raise HTTPException(status_code=400, detail="Opisz danie.")
+    servings = max(1, min(999, body.servings))
+    meal_type_line = (
+        f"Rodzaj posilku: {body.meal_type}" if body.meal_type.strip() else ""
+    )
+    prompt = f"""
+Wygeneruj kompletny przepis kulinarny po polsku na podstawie opisu.
+Opis uzytkownika: {description}
+Liczba porcji: {servings}
+{meal_type_line}
+
+Zwroc WYLACZNIE poprawny JSON bez markdown, bez ```json:
+{{
+  "name": "nazwa dania",
+  "description": "2-3 zdania opisu",
+  "ingredients": ["ILOSC JEDNOSTKA NAZWA, np. 200 g maki pszennej", "..."],
+  "steps": ["krok 1", "krok 2"],
+  "servings": {servings},
+  "prep_minutes": laczny_czas_w_minutach,
+  "difficulty": "latwy/sredni/trudny",
+  "equipment": ["potrzebny sprzet"],
+  "calories": kcal_calego_dania,
+  "protein": g_bialka_calego_dania,
+  "carbs": g_weglowodanow,
+  "sugar": g_cukru,
+  "fat": g_tluszczu,
+  "fiber": g_blonnika,
+  "salt": g_soli,
+  "total_weight_grams": masa_gotowego_dania_g,
+  "allergens": ["alergeny"],
+  "substitutes": ["SKLADNIK -> ZAMIENNIK (proporcja)"],
+  "storage": "1-2 zdania o przechowywaniu"
+}}
+Wymagania: skladniki z ilosciami i jednostkami (g/kg/ml/l/szt), UWZGLEDNIJ
+przyprawy, wartosci odzywcze szacuj realistycznie dla CALEGO dania.
+"""
+    try:
+        data = generate_text_json(prompt)
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=str(error))
+    print("PRZEPIS AI:", str(data)[:400])
+    if not data.get("name") or not data.get("ingredients") or not data.get("steps"):
+        raise HTTPException(
+            status_code=502,
+            detail="AI zwrocilo niepelny przepis - sprobuj ponownie.",
+        )
+    data["source"] = "AI"
+    return data
+
+
+class ImportUrlRequest(BaseModel):
+    url: str
+
+
+@app.post("/v1/recipes/import-url")
+def import_recipe_url(body: ImportUrlRequest):
+    """Pobiera strone przepisu PO STRONIE BACKENDU (przegladarki blokuja
+    aplikacje po User-Agent) i zwraca HTML do parsowania JSON-LD Recipe
+    w aplikacji. Limit rozmiaru chroni przed ogromnymi stronami."""
+    url = body.url.strip()
+    if not url.lower().startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Podaj pelny link http(s).")
+    try:
+        response = requests.get(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/126.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "pl,nl;q=0.9,en;q=0.8",
+            },
+            timeout=15,
+            allow_redirects=True,
+        )
+    except requests.RequestException as error:
+        raise HTTPException(status_code=502, detail=f"Nie pobrano strony: {error}")
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Strona zwrocila HTTP {response.status_code}.",
+        )
+    html = response.text
+    if len(html) > 1_500_000:
+        html = html[:1_500_000]
+    return {"url": url, "html": html}
