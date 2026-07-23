@@ -780,6 +780,225 @@ class RecipeGenerateRequest(BaseModel):
     meal_type: str = ""
 
 
+def build_recipe_prompt(
+    description: str,
+    servings: int,
+    meal_type: str = "",
+    *,
+    from_image: bool = False,
+) -> str:
+    """Kontrakt AI przepisu z audytowalnym rozliczeniem skladnikow."""
+    meal_type_line = (
+        f"Rodzaj posilku: {meal_type.strip()}" if meal_type.strip() else ""
+    )
+    image_line = (
+        "Zdjecie moze przedstawic gotowe danie, skladniki, etykiete albo "
+        "zrzut przepisu. Uzyj go razem z opisem."
+        if from_image
+        else ""
+    )
+    return f"""
+Przygotuj kompletny przepis kulinarny po polsku na podstawie danych uzytkownika.
+Opis uzytkownika: {description}
+Liczba porcji: {servings}
+{meal_type_line}
+{image_line}
+
+Zwroc WYLACZNIE poprawny JSON bez markdown:
+{{
+  "name": "nazwa dania",
+  "description": "2-3 zdania opisu",
+  "category": "jedna z: Domowe, Sniadanie, Obiad, Kolacja, Zupa, Sos, Deser, Przekaska, Napoj",
+  "time_of_day": "jedna z: Dowolnie, Sniadanie, Obiad, Kolacja, Przekaska",
+  "tags": ["krotkie tagi"],
+  "ingredients": ["czytelna linia skladnika z iloscia i stanem produktu"],
+  "ingredient_details": [
+    {{
+      "line": "500 g makaronu suchego (masa przed gotowaniem)",
+      "name": "makaron pszenny",
+      "amount_grams": 500,
+      "state": "dry",
+      "included": true,
+      "calories_per_100g": 350,
+      "protein_per_100g": 12,
+      "carbs_per_100g": 72,
+      "sugar_per_100g": 3,
+      "fat_per_100g": 1.5,
+      "fiber_per_100g": 3,
+      "salt_per_100g": 0.02
+    }}
+  ],
+  "steps": ["krok 1", "krok 2"],
+  "servings": {servings},
+  "prep_minutes": 30,
+  "difficulty": "latwy/sredni/trudny",
+  "equipment": ["potrzebny sprzet"],
+  "calories": kcal_calego_dania,
+  "protein": g_bialka_calego_dania,
+  "carbs": g_weglowodanow_calego_dania,
+  "sugar": g_cukru_calego_dania,
+  "fat": g_tluszczu_calego_dania,
+  "fiber": g_blonnika_calego_dania,
+  "salt": g_soli_calego_dania,
+  "fluid_ml": ml_plynow_w_calym_daniu,
+  "ingredients_weight_grams": masa_skladnikow_przed_przygotowaniem,
+  "total_weight_grams": szacowana_masa_gotowego_dania,
+  "confidence": liczba_od_0_do_1,
+  "allergens": ["alergeny"],
+  "substitutes": ["SKLADNIK -> ZAMIENNIK (proporcja)"],
+  "storage": "1-2 zdania o przechowywaniu"
+}}
+
+ZASADY OBLICZEN:
+- Podane przez uzytkownika ilosci sa nadrzedne. Nie zmieniaj 500 g na 300 g.
+- Dla makaronu, ryzu, kaszy i platkow podanych przed gotowaniem uzyj masy
+  SUCHEJ i wartosci odzywczych suchego produktu. Woda wchlonieta podczas
+  gotowania zwieksza tylko total_weight_grams, nigdy kalorie ani makro.
+- Dla miesa i warzyw uzyj masy surowej, jezeli opis nie mowi inaczej.
+- Dla konserw podanych jako odsadzone uzyj masy po odsaczeniu. Tunczyk w
+  sosie wlasnym/solance nie zawiera oleju z puszki.
+- Nie dodawaj oleju, masla, sera ani sosu, jesli uzytkownik ich nie podal.
+  Sugestie opcjonalne oznacz included=false i nie wliczaj ich do sumy.
+- W ingredient_details podaj jadalna mase uzyta do obliczen i wartosci na
+  100 g dokladnie dla stanu dry/raw/drained/cooked/as_sold.
+- Wody do gotowania, ktora jest odlewana, nie umieszczaj w ingredient_details.
+  Wode pozostajaca w daniu mozna dodac z zerowymi wartosciami odzywczymi.
+- Pola calories/protein/carbs/sugar/fat/fiber/salt maja oznaczac SUME CALEGO
+  przepisu. Serwer i tak przeliczy je ponownie z ingredient_details.
+- ingredients_weight_grams oznacza sume mas uzytych do obliczen przed
+  przygotowaniem. total_weight_grams oznacza mase po ugotowaniu/upieczeniu.
+- Kazdy skladnik kaloryczny musi miec osobny wpis ingredient_details.
+- Gdy ilosc jest niewidoczna, oszacuj ja ostroznie i obniz confidence.
+"""
+
+
+def normalize_recipe_result(data: dict, servings: int) -> dict:
+    """Sumuje makro z mas i wartosci /100 g zamiast ufac jednej sumie AI."""
+    result = dict(data)
+    details = result.get("ingredient_details")
+    normalized_details = []
+    ingredient_lines = []
+    totals = {
+        "calories": 0.0,
+        "protein": 0.0,
+        "carbs": 0.0,
+        "sugar": 0.0,
+        "fat": 0.0,
+        "fiber": 0.0,
+        "salt": 0.0,
+    }
+    ingredients_weight = 0.0
+    calculated_count = 0
+
+    if isinstance(details, list):
+        for raw_item in details:
+            if not isinstance(raw_item, dict):
+                continue
+            item = dict(raw_item)
+            included_raw = item.get("included", True)
+            included = not (
+                included_raw is False
+                or str(included_raw).strip().lower() in ("false", "0", "no", "nie")
+            )
+            amount = max(
+                0.0,
+                to_float(
+                    item.get("amount_grams")
+                    or item.get("grams")
+                    or item.get("edible_grams"),
+                    0,
+                ),
+            )
+            name = str(item.get("name") or "skladnik").strip()
+            state = str(item.get("state") or "as_sold").strip().lower()
+            line = str(item.get("line") or "").strip()
+            if not line:
+                amount_text = f"{amount:g} g " if amount > 0 else ""
+                line = f"{amount_text}{name} ({state})".strip()
+            if not included and "opcjonal" not in line.lower():
+                line += " (opcjonalnie, poza wyliczeniem)"
+            ingredient_lines.append(line)
+
+            per100 = {
+                key: max(
+                    0.0,
+                    to_float(
+                        item.get(f"{key}_per_100g")
+                        or item.get(f"{key}_per100")
+                        or item.get(f"{key}_100g"),
+                        0,
+                    ),
+                )
+                for key in totals
+            }
+            if per100["calories"] <= 0 and any(
+                per100[key] > 0 for key in ("protein", "carbs", "fat")
+            ):
+                per100["calories"] = (
+                    per100["protein"] * 4
+                    + per100["carbs"] * 4
+                    + per100["fat"] * 9
+                )
+
+            item.update(
+                {
+                    "line": line,
+                    "name": name,
+                    "state": state,
+                    "amount_grams": round(amount, 2),
+                    "included": included,
+                    **{f"{key}_per_100g": round(value, 4) for key, value in per100.items()},
+                }
+            )
+            normalized_details.append(item)
+
+            if not included or amount <= 0:
+                continue
+            ingredients_weight += amount
+            if any(value > 0 for value in per100.values()):
+                calculated_count += 1
+            factor = amount / 100
+            for key, value in per100.items():
+                totals[key] += value * factor
+
+    if ingredient_lines:
+        result["ingredients"] = ingredient_lines
+    result["ingredient_details"] = normalized_details
+    result["servings"] = max(1, min(999, int(servings)))
+
+    if calculated_count > 0:
+        # Python stosuje round-half-to-even, a aplikacja Dart zaokragla .5
+        # od zera. Dla dodatnich wartosci odzywczych zachowujemy semantyke UI.
+        whole = lambda value: int(value + 0.5)
+        result["calories"] = whole(totals["calories"])
+        result["protein"] = whole(totals["protein"])
+        result["carbs"] = whole(totals["carbs"])
+        result["sugar"] = whole(totals["sugar"])
+        result["fat"] = whole(totals["fat"])
+        result["fiber"] = round(totals["fiber"], 1)
+        result["salt"] = round(totals["salt"], 2)
+        result["ingredients_weight_grams"] = round(ingredients_weight, 1)
+        result["nutrition_calculation_note"] = (
+            "Makro zsumowano ze skladnikow wedlug masy suchej, surowej lub "
+            "odsaczonej. Zmiana masy podczas gotowania wplywa tylko na mase "
+            "gotowego dania i wartosci na 100 g."
+        )
+        result["nutrition_calculation_method"] = "ingredient_sum_v1"
+
+    total_weight = max(
+        0.0,
+        to_float(
+            result.get("total_weight_grams")
+            or result.get("totalWeightGrams"),
+            0,
+        ),
+    )
+    if total_weight <= 0 and ingredients_weight > 0:
+        total_weight = ingredients_weight
+    result["total_weight_grams"] = round(total_weight, 1)
+    return result
+
+
 @app.post("/v1/recipes/generate")
 def generate_recipe(body: RecipeGenerateRequest):
     """Generowanie przepisu przez AI - osobny kontrakt JSON (nie schemat
@@ -788,42 +1007,9 @@ def generate_recipe(body: RecipeGenerateRequest):
     if len(description) < 3:
         raise HTTPException(status_code=400, detail="Opisz danie.")
     servings = max(1, min(999, body.servings))
-    meal_type_line = (
-        f"Rodzaj posilku: {body.meal_type}" if body.meal_type.strip() else ""
-    )
-    prompt = f"""
-Wygeneruj kompletny przepis kulinarny po polsku na podstawie opisu.
-Opis uzytkownika: {description}
-Liczba porcji: {servings}
-{meal_type_line}
-
-Zwroc WYLACZNIE poprawny JSON bez markdown, bez ```json:
-{{
-  "name": "nazwa dania",
-  "description": "2-3 zdania opisu",
-  "ingredients": ["ILOSC JEDNOSTKA NAZWA, np. 200 g maki pszennej", "..."],
-  "steps": ["krok 1", "krok 2"],
-  "servings": {servings},
-  "prep_minutes": laczny_czas_w_minutach,
-  "difficulty": "latwy/sredni/trudny",
-  "equipment": ["potrzebny sprzet"],
-  "calories": kcal_calego_dania,
-  "protein": g_bialka_calego_dania,
-  "carbs": g_weglowodanow,
-  "sugar": g_cukru,
-  "fat": g_tluszczu,
-  "fiber": g_blonnika,
-  "salt": g_soli,
-  "total_weight_grams": masa_gotowego_dania_g,
-  "allergens": ["alergeny"],
-  "substitutes": ["SKLADNIK -> ZAMIENNIK (proporcja)"],
-  "storage": "1-2 zdania o przechowywaniu"
-}}
-Wymagania: skladniki z ilosciami i jednostkami (g/kg/ml/l/szt), UWZGLEDNIJ
-przyprawy, wartosci odzywcze szacuj realistycznie dla CALEGO dania.
-"""
+    prompt = build_recipe_prompt(description, servings, body.meal_type)
     try:
-        data = generate_text_json(prompt)
+        data = normalize_recipe_result(generate_text_json(prompt), servings)
     except Exception as error:
         raise HTTPException(status_code=502, detail=str(error))
     print("PRZEPIS AI:", str(data)[:400])
@@ -831,6 +1017,62 @@ przyprawy, wartosci odzywcze szacuj realistycznie dla CALEGO dania.
         raise HTTPException(
             status_code=502,
             detail="AI zwrocilo niepelny przepis - sprobuj ponownie.",
+        )
+    data["source"] = "AI"
+    return data
+
+
+@app.post("/v1/recipes/analyze")
+async def analyze_recipe(
+    file: UploadFile = File(...),
+    description: str = Form(""),
+    servings: int = Form(1),
+    meal_type: str = Form(""),
+    ai_provider: Optional[str] = Form(None),
+):
+    """Uzupelnia edytor przepisu z opisu i/lub zdjecia bez zmiany /analyze-meal."""
+    image_bytes = await file.read()
+    if len(image_bytes) > 12 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Zdjecie jest za duze (max 12 MB).")
+    if not image_bytes and len(description.strip()) < 3:
+        raise HTTPException(status_code=400, detail="Dodaj zdjecie albo opis przepisu.")
+
+    safe_servings = max(1, min(999, int(servings)))
+    prompt = build_recipe_prompt(
+        description.strip(),
+        safe_servings,
+        meal_type,
+        from_image=True,
+    )
+    selected_provider = (ai_provider or AI_PROVIDER).strip().lower()
+    mime_type = get_mime_type(image_bytes)
+    try:
+        if selected_provider in ("openai", "gpt"):
+            data = await analyze_with_openai(prompt, image_bytes, mime_type)
+        elif selected_provider == "gemini":
+            data = await analyze_with_gemini(prompt, image_bytes, mime_type)
+        elif selected_provider == "openai_then_gemini":
+            try:
+                data = await analyze_with_openai(prompt, image_bytes, mime_type)
+            except Exception:
+                data = await analyze_with_gemini(prompt, image_bytes, mime_type)
+        elif selected_provider == "gemini_then_openai":
+            try:
+                data = await analyze_with_gemini(prompt, image_bytes, mime_type)
+            except Exception:
+                data = await analyze_with_openai(prompt, image_bytes, mime_type)
+        else:
+            raise HTTPException(status_code=400, detail="Nieznany dostawca AI.")
+        data = normalize_recipe_result(data, safe_servings)
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=str(error))
+
+    if not data.get("name") or not data.get("ingredients"):
+        raise HTTPException(
+            status_code=502,
+            detail="AI zwrocilo niepelne dane przepisu - doprecyzuj opis.",
         )
     data["source"] = "AI"
     return data
