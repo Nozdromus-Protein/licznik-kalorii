@@ -848,6 +848,7 @@ Zwroc WYLACZNIE poprawny JSON bez markdown:
       "carbs_per_100g": 72,
       "sugar_per_100g": 3,
       "fat_per_100g": 1.5,
+      "saturated_fat_per_100g": 0.3,
       "fiber_per_100g": 3,
       "salt_per_100g": 0.02
     }}
@@ -862,6 +863,7 @@ Zwroc WYLACZNIE poprawny JSON bez markdown:
   "carbs": g_weglowodanow_calego_dania,
   "sugar": g_cukru_calego_dania,
   "fat": g_tluszczu_calego_dania,
+  "saturated_fat": g_tluszczow_nasyconych_calego_dania,
   "fiber": g_blonnika_calego_dania,
   "salt": g_soli_calego_dania,
   "fluid_ml": ml_plynow_w_calym_daniu,
@@ -908,6 +910,7 @@ def normalize_recipe_result(data: dict, servings: int) -> dict:
         "carbs": 0.0,
         "sugar": 0.0,
         "fat": 0.0,
+        "saturated_fat": 0.0,
         "fiber": 0.0,
         "salt": 0.0,
     }
@@ -999,6 +1002,7 @@ def normalize_recipe_result(data: dict, servings: int) -> dict:
         result["carbs"] = whole(totals["carbs"])
         result["sugar"] = whole(totals["sugar"])
         result["fat"] = whole(totals["fat"])
+        result["saturated_fat"] = round(totals["saturated_fat"], 1)
         result["fiber"] = round(totals["fiber"], 1)
         result["salt"] = round(totals["salt"], 2)
         result["ingredients_weight_grams"] = round(ingredients_weight, 1)

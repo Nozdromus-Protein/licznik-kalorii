@@ -21,6 +21,7 @@ class RecipeNutritionNormalizationTest(unittest.TestCase):
                     "carbs_per_100g": 72,
                     "sugar_per_100g": 3,
                     "fat_per_100g": 1.5,
+                    "saturated_fat_per_100g": 0.3,
                     "fiber_per_100g": 3,
                     "salt_per_100g": 0.02,
                 },
@@ -34,6 +35,7 @@ class RecipeNutritionNormalizationTest(unittest.TestCase):
                     "carbs_per_100g": 0,
                     "sugar_per_100g": 0,
                     "fat_per_100g": 1,
+                    "saturated_fat_per_100g": 0.3,
                     "fiber_per_100g": 0,
                     "salt_per_100g": 1,
                 },
@@ -47,6 +49,7 @@ class RecipeNutritionNormalizationTest(unittest.TestCase):
                     "carbs_per_100g": 3.9,
                     "sugar_per_100g": 2.6,
                     "fat_per_100g": 0.2,
+                    "saturated_fat_per_100g": 0.03,
                     "fiber_per_100g": 1.2,
                     "salt_per_100g": 0.01,
                 },
@@ -73,6 +76,7 @@ class RecipeNutritionNormalizationTest(unittest.TestCase):
         self.assertEqual(result["ingredients_weight_grams"], 1040)
         self.assertEqual(result["total_weight_grams"], 2200)
         self.assertEqual(result["fat"], 11)
+        self.assertEqual(result["saturated_fat"], 2.3)
         self.assertEqual(result["calories"], 2082)
         self.assertEqual(result["nutrition_calculation_method"], "ingredient_sum_v1")
         self.assertIn("suchego", result["ingredients"][0])
