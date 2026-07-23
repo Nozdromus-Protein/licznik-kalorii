@@ -632,6 +632,30 @@ def generate_text_json(prompt: str) -> dict:
     raise RuntimeError(f"Wszystkie modele/klucze Gemini zwrocily blad: {last_error}")
 
 
+def generate_openai_text_json(prompt: str) -> dict:
+    """Tekstowy JSON przez OpenAI, bez sztucznego obrazka-placeholdera."""
+    client = get_openai_client()
+    response = client.responses.create(
+        model=OPENAI_MODEL,
+        input=[
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": prompt}],
+            }
+        ],
+        max_output_tokens=8000,
+    )
+    result_text = getattr(response, "output_text", "") or ""
+    if not result_text:
+        chunks = []
+        for item in getattr(response, "output", []):
+            for content in getattr(item, "content", []):
+                if hasattr(content, "text"):
+                    chunks.append(content.text)
+        result_text = "\n".join(chunks)
+    return json.loads(clean_json_text(result_text))
+
+
 class TranslateRequest(BaseModel):
     text: str
     target: str
@@ -1024,14 +1048,14 @@ def generate_recipe(body: RecipeGenerateRequest):
 
 @app.post("/v1/recipes/analyze")
 async def analyze_recipe(
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
     description: str = Form(""),
     servings: int = Form(1),
     meal_type: str = Form(""),
     ai_provider: Optional[str] = Form(None),
 ):
     """Uzupelnia edytor przepisu z opisu i/lub zdjecia bez zmiany /analyze-meal."""
-    image_bytes = await file.read()
+    image_bytes = await file.read() if file is not None else b""
     if len(image_bytes) > 12 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Zdjecie jest za duze (max 12 MB).")
     if not image_bytes and len(description.strip()) < 3:
@@ -1045,22 +1069,32 @@ async def analyze_recipe(
         from_image=True,
     )
     selected_provider = (ai_provider or AI_PROVIDER).strip().lower()
-    mime_type = get_mime_type(image_bytes)
+    mime_type = get_mime_type(image_bytes) if image_bytes else ""
+
+    async def analyze_with(provider_name: str) -> dict:
+        if provider_name in ("openai", "gpt"):
+            if image_bytes:
+                return await analyze_with_openai(prompt, image_bytes, mime_type)
+            return generate_openai_text_json(prompt)
+        if image_bytes:
+            return await analyze_with_gemini(prompt, image_bytes, mime_type)
+        return generate_text_json(prompt)
+
     try:
         if selected_provider in ("openai", "gpt"):
-            data = await analyze_with_openai(prompt, image_bytes, mime_type)
+            data = await analyze_with(selected_provider)
         elif selected_provider == "gemini":
-            data = await analyze_with_gemini(prompt, image_bytes, mime_type)
+            data = await analyze_with("gemini")
         elif selected_provider == "openai_then_gemini":
             try:
-                data = await analyze_with_openai(prompt, image_bytes, mime_type)
+                data = await analyze_with("openai")
             except Exception:
-                data = await analyze_with_gemini(prompt, image_bytes, mime_type)
+                data = await analyze_with("gemini")
         elif selected_provider == "gemini_then_openai":
             try:
-                data = await analyze_with_gemini(prompt, image_bytes, mime_type)
+                data = await analyze_with("gemini")
             except Exception:
-                data = await analyze_with_openai(prompt, image_bytes, mime_type)
+                data = await analyze_with("openai")
         else:
             raise HTTPException(status_code=400, detail="Nieznany dostawca AI.")
         data = normalize_recipe_result(data, safe_servings)

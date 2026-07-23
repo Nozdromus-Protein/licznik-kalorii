@@ -1,5 +1,7 @@
+import asyncio
 import unittest
 
+import main
 from main import normalize_recipe_result
 
 
@@ -90,6 +92,44 @@ class RecipeNutritionNormalizationTest(unittest.TestCase):
         self.assertEqual(result["calories"], 1200)
         self.assertEqual(result["fat"], 45)
         self.assertNotIn("nutrition_calculation_method", result)
+
+    def test_description_only_analysis_does_not_require_placeholder_image(self):
+        original_generate = main.generate_text_json
+        main.generate_text_json = lambda _: {
+            "name": "Makaron z tunczykiem",
+            "ingredients": ["300 g makaronu suchego"],
+            "steps": ["Ugotuj makaron."],
+            "ingredient_details": [
+                {
+                    "line": "300 g makaronu suchego",
+                    "name": "makaron",
+                    "amount_grams": 300,
+                    "state": "dry",
+                    "calories_per_100g": 350,
+                    "protein_per_100g": 12,
+                    "carbs_per_100g": 72,
+                    "fat_per_100g": 1.5,
+                }
+            ],
+            "total_weight_grams": 750,
+        }
+        try:
+            result = asyncio.run(
+                main.analyze_recipe(
+                    file=None,
+                    description="300 g makaronu suchego",
+                    servings=3,
+                    meal_type="Obiad",
+                    ai_provider="gemini",
+                )
+            )
+        finally:
+            main.generate_text_json = original_generate
+
+        self.assertEqual(result["servings"], 3)
+        self.assertEqual(result["fat"], 5)
+        self.assertEqual(result["total_weight_grams"], 750)
+        self.assertEqual(result["nutrition_calculation_method"], "ingredient_sum_v1")
 
 
 if __name__ == "__main__":
