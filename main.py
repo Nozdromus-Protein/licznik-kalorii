@@ -619,7 +619,8 @@ def generate_text_json(prompt: str) -> dict:
     for model_name in GEMINI_MODELS:
         for index in range(len(GEMINI_API_KEYS)):
             try:
-                response = get_gemini_client(index).models.generate_content(
+                current_client = get_gemini_client(index)
+                response = current_client.models.generate_content(
                     model=model_name,
                     contents=[prompt],
                 )
