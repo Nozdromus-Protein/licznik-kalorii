@@ -3,7 +3,7 @@ import base64
 import json
 import os
 import re
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -1070,7 +1070,10 @@ async def analyze_recipe(
         description.strip(),
         safe_servings,
         meal_type,
-        from_image=True,
+        # Zdanie o zdjeciu tylko wtedy, gdy zdjecie faktycznie doszlo -
+        # inaczej model dostaje instrukcje "uzyj zdjecia razem z opisem"
+        # przy analizie z samego tekstu.
+        from_image=bool(image_bytes),
     )
     selected_provider = (ai_provider or AI_PROVIDER).strip().lower()
     mime_type = get_mime_type(image_bytes) if image_bytes else ""
@@ -1154,3 +1157,228 @@ def import_recipe_url(body: ImportUrlRequest):
     if len(html) > 1_500_000:
         html = html[:1_500_000]
     return {"url": url, "html": html}
+
+
+# ============================================================
+# Czat AI diety — odpowiednik "/chat" z backendu Trainera, ale z persona
+# dietetyka i kontekstem z Licznika Kalorii (posilki, makro, cele, waga).
+# ============================================================
+
+
+class KalorieChatRequest(BaseModel):
+    message: str
+    # Profil uzytkownika (cele kcal/makro, plec, wiek, aktywnosc).
+    user: Optional[Dict[str, Any]] = None
+    # Pelny kontekst z aplikacji: dzis, srednie 7/30 dni, trendy, waga
+    # i sylwetka z Trainera, rozmiary baz (produkty/skladniki/przepisy).
+    context: Optional[Dict[str, Any]] = None
+    # Dodatkowe instrukcje z aplikacji (jak korzystac z kontekstu).
+    instructions: Optional[str] = None
+    history: Optional[List[Any]] = None
+    # Zalaczniki uzytkownika: zdjecia (data_base64) i pliki tekstowe (text).
+    # Format wpisu: {"name", "mime", "kind": "image"|"text", "text"?,
+    # "data_base64"?, "size_bytes"?}.
+    attachments: Optional[List[Dict[str, Any]]] = None
+    ai_provider: Optional[str] = None
+    provider: Optional[str] = None
+
+
+# Limity zalacznikow — chronia prompt i pamiec instancji.
+MAX_ATTACHMENT_IMAGES = 4
+MAX_ATTACHMENT_TEXT_CHARS = 40000
+MAX_ATTACHMENT_TEXT_TOTAL = 120000
+
+
+def split_chat_attachments(attachments):
+    """Dzieli zalaczniki na sekcje tekstowa promptu i liste obrazow.
+
+    Zwraca (text_section, images), gdzie images to lista (bytes, mime_type).
+    Bledne wpisy sa POMIJANE, ale zostawiaja slad w sekcji tekstowej — model
+    ma wiedziec, ze zalacznik byl, tylko nie dalo sie go odczytac.
+    """
+    if not attachments:
+        return "", []
+
+    text_chunks = []
+    images = []
+    used_chars = 0
+
+    for item in attachments:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "zalacznik")
+        kind = str(item.get("kind") or "").lower()
+        mime = str(item.get("mime") or "")
+        raw_base64 = str(item.get("data_base64") or "")
+
+        if kind == "image" or mime.startswith("image/"):
+            if len(images) >= MAX_ATTACHMENT_IMAGES:
+                text_chunks.append(f"[Zalacznik {name}: pominiety — limit {MAX_ATTACHMENT_IMAGES} zdjec]")
+                continue
+            try:
+                image_bytes = base64.b64decode(raw_base64, validate=False)
+            except Exception:
+                image_bytes = b""
+            if not image_bytes:
+                text_chunks.append(f"[Zalacznik {name}: nie udalo sie odczytac zdjecia]")
+                continue
+            images.append((image_bytes, mime or get_mime_type(image_bytes)))
+            text_chunks.append(f"[Zalacznik {name}: zdjecie przekazane do analizy]")
+            continue
+
+        content = str(item.get("text") or "")
+        if not content.strip():
+            text_chunks.append(f"[Zalacznik {name}: pusty plik]")
+            continue
+        if len(content) > MAX_ATTACHMENT_TEXT_CHARS:
+            content = content[:MAX_ATTACHMENT_TEXT_CHARS] + "\n[...] (przyciete)"
+        if used_chars + len(content) > MAX_ATTACHMENT_TEXT_TOTAL:
+            text_chunks.append(f"[Zalacznik {name}: pominiety — laczny limit tekstu]")
+            continue
+        used_chars += len(content)
+        text_chunks.append(f"--- Zalacznik: {name} ---\n{content}\n--- koniec: {name} ---")
+
+    if not text_chunks:
+        return "", images
+
+    section = "\nZalaczniki od uzytkownika (traktuj jak czesc pytania):\n" + "\n".join(text_chunks) + "\n"
+    return section, images
+
+
+def generate_text_json_with_images(prompt: str, images) -> dict:
+    """Tekstowy JSON z Gemini, ale z dolaczonymi obrazami uzytkownika."""
+    parts = [prompt]
+    for image_bytes, mime in images:
+        parts.append(types.Part.from_bytes(data=image_bytes, mime_type=mime or "image/jpeg"))
+
+    last_error = None
+    for model_name in GEMINI_MODELS:
+        for index in range(len(GEMINI_API_KEYS)):
+            try:
+                current_client = get_gemini_client(index)
+                response = current_client.models.generate_content(
+                    model=model_name,
+                    contents=parts,
+                )
+                return json.loads(clean_json_text(response.text or ""))
+            except Exception as error:
+                last_error = str(error)
+                print(f"BLAD TEXT-JSON+IMG MODEL {model_name} KLUCZ {index + 1}:", last_error)
+                continue
+    raise RuntimeError(f"Wszystkie modele/klucze Gemini zwrocily blad: {last_error}")
+
+
+def generate_openai_text_json_with_images(prompt: str, images) -> dict:
+    """To samo przez OpenAI (Responses API, input_image jako data URL)."""
+    client = get_openai_client()
+    content = [{"type": "input_text", "text": prompt}]
+    for image_bytes, mime in images:
+        encoded = base64.b64encode(image_bytes).decode("utf-8")
+        content.append(
+            {
+                "type": "input_image",
+                "image_url": f"data:{mime or 'image/jpeg'};base64,{encoded}",
+            }
+        )
+    response = client.responses.create(
+        model=OPENAI_MODEL,
+        input=[{"role": "user", "content": content}],
+        max_output_tokens=8000,
+    )
+    result_text = getattr(response, "output_text", "") or ""
+    if not result_text:
+        chunks = []
+        for item in getattr(response, "output", []):
+            for part in getattr(item, "content", []):
+                if hasattr(part, "text"):
+                    chunks.append(part.text)
+        result_text = "\n".join(chunks)
+    return json.loads(clean_json_text(result_text))
+
+
+def build_kalorie_chat_prompt(req: KalorieChatRequest, attachments_section: str = "") -> str:
+    history_text = ""
+    if req.history:
+        lines = []
+        for item in req.history:
+            if isinstance(item, dict):
+                role = "Uzytkownik" if str(item.get("role")) == "user" else "Dietetyk"
+                content = str(item.get("content") or "").strip()
+                if content:
+                    lines.append(f"{role}: {content}")
+        history_text = "\n".join(lines)
+
+    context_section = ""
+    if req.context:
+        context_section = f"""
+Dane z aplikacji Licznik Kalorii (kontekst - traktuj jako ZRODLO PRAWDY
+o uzytkowniku; zawiera: dzisiejsze posilki i sumy, cele dzienne kcal i makro,
+srednie oraz trendy z ostatnich 7 i 30 dni, nawodnienie, wage i sklad ciala
+z Trainera, cel sylwetki i strategie, rozmiary wlasnych baz produktow,
+skladnikow i przepisow):
+{json.dumps(req.context, ensure_ascii=False)}
+"""
+
+    instructions_section = ""
+    if req.instructions:
+        instructions_section = f"""
+Instrukcje z aplikacji:
+{req.instructions}
+"""
+
+    return f"""
+Jestes dietetykiem AI w aplikacji Licznik Kalorii. Odpowiadasz po polsku,
+krotko, praktycznie i konkretnie - jak dietetyk, ktory zna historie klienta.
+
+Pytanie uzytkownika:
+"{req.message}"
+{context_section}{instructions_section}{attachments_section}
+Poprzednia rozmowa:
+{history_text}
+
+Zasady odpowiedzi:
+- Opieraj sie WYLACZNIE na liczbach z pola "context". Nie zmyslaj wartosci.
+- Jezeli sa zalaczniki (zdjecia albo pliki tekstowe), odnies sie do nich wprost.
+- Jezeli danych brakuje, powiedz wprost jakich, zamiast zgadywac.
+- Podawaj konkretne liczby (kcal, gramy bialka/weglowodanow/tluszczu).
+- Maksymalnie 6 zdan albo krotka lista punktow.
+- Nie stawiaj diagnoz medycznych; przy niepokojacych sygnalach odsylaj do lekarza.
+
+Zwroc WYLACZNIE JSON w formacie:
+{{"reply": "tekst odpowiedzi"}}
+"""
+
+
+@app.post("/chat")
+@app.post("/ai/chat")
+async def kalorie_chat(req: KalorieChatRequest):
+    try:
+        attachments_section, images = split_chat_attachments(req.attachments)
+        prompt = build_kalorie_chat_prompt(req, attachments_section)
+        selected = (req.ai_provider or req.provider or AI_PROVIDER).strip().lower()
+        if selected in ("openai", "gpt"):
+            if images:
+                raw = await asyncio.to_thread(generate_openai_text_json_with_images, prompt, images)
+            else:
+                raw = await asyncio.to_thread(generate_openai_text_json, prompt)
+        else:
+            if images:
+                raw = await asyncio.to_thread(generate_text_json_with_images, prompt, images)
+            else:
+                raw = await asyncio.to_thread(generate_text_json, prompt)
+        reply = str(
+            raw.get("reply")
+            or raw.get("message")
+            or raw.get("content")
+            or raw.get("answer")
+            or "Nie udalo sie przygotowac odpowiedzi."
+        )
+        return {"reply": reply}
+    except Exception as error:
+        error_text = str(error)
+        print("BLAD KALORIE CHAT:", error_text)
+        return {
+            "reply": "Dietetyk AI ma chwilowy problem z odpowiedzia. Sprobuj ponownie za moment.",
+            "error": error_text,
+            "kind": "kalorie_chat",
+        }
