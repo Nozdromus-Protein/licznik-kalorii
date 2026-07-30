@@ -612,9 +612,13 @@ async def analyze_meal(
 # ============================================================================
 
 
-def generate_text_json(prompt: str) -> dict:
+def generate_text_json(prompt: str, meta: Optional[Dict[str, Any]] = None) -> dict:
     """Tekstowe zapytanie do Gemini (bez obrazu) z ta sama rotacja modeli
-    i kluczy co analiza posilkow. Zwraca zdekodowany JSON."""
+    i kluczy co analiza posilkow. Zwraca zdekodowany JSON.
+
+    `meta` (opcjonalne) dostaje informacje, KTORY silnik i model odpowiedzial —
+    osobnym slownikiem, zeby nie doklejac pol do odpowiedzi endpointow, ktore
+    zwracaja ten JSON wprost (przepisy)."""
     last_error = None
     for model_name in GEMINI_MODELS:
         for index in range(len(GEMINI_API_KEYS)):
@@ -624,7 +628,11 @@ def generate_text_json(prompt: str) -> dict:
                     model=model_name,
                     contents=[prompt],
                 )
-                return json.loads(clean_json_text(response.text or ""))
+                result = json.loads(clean_json_text(response.text or ""))
+                if meta is not None:
+                    meta["aiProvider"] = "gemini"
+                    meta["aiModel"] = model_name
+                return result
             except Exception as error:
                 last_error = str(error)
                 print(f"BLAD TEXT-JSON MODEL {model_name} KLUCZ {index + 1}:", last_error)
@@ -632,8 +640,11 @@ def generate_text_json(prompt: str) -> dict:
     raise RuntimeError(f"Wszystkie modele/klucze Gemini zwrocily blad: {last_error}")
 
 
-def generate_openai_text_json(prompt: str) -> dict:
+def generate_openai_text_json(prompt: str, meta: Optional[Dict[str, Any]] = None) -> dict:
     """Tekstowy JSON przez OpenAI, bez sztucznego obrazka-placeholdera."""
+    if meta is not None:
+        meta["aiProvider"] = "openai"
+        meta["aiModel"] = OPENAI_MODEL
     client = get_openai_client()
     response = client.responses.create(
         model=OPENAI_MODEL,
@@ -1245,7 +1256,11 @@ def split_chat_attachments(attachments):
     return section, images
 
 
-def generate_text_json_with_images(prompt: str, images) -> dict:
+def generate_text_json_with_images(
+    prompt: str,
+    images,
+    meta: Optional[Dict[str, Any]] = None,
+) -> dict:
     """Tekstowy JSON z Gemini, ale z dolaczonymi obrazami uzytkownika."""
     parts = [prompt]
     for image_bytes, mime in images:
@@ -1260,7 +1275,11 @@ def generate_text_json_with_images(prompt: str, images) -> dict:
                     model=model_name,
                     contents=parts,
                 )
-                return json.loads(clean_json_text(response.text or ""))
+                result = json.loads(clean_json_text(response.text or ""))
+                if meta is not None:
+                    meta["aiProvider"] = "gemini"
+                    meta["aiModel"] = model_name
+                return result
             except Exception as error:
                 last_error = str(error)
                 print(f"BLAD TEXT-JSON+IMG MODEL {model_name} KLUCZ {index + 1}:", last_error)
@@ -1268,8 +1287,15 @@ def generate_text_json_with_images(prompt: str, images) -> dict:
     raise RuntimeError(f"Wszystkie modele/klucze Gemini zwrocily blad: {last_error}")
 
 
-def generate_openai_text_json_with_images(prompt: str, images) -> dict:
+def generate_openai_text_json_with_images(
+    prompt: str,
+    images,
+    meta: Optional[Dict[str, Any]] = None,
+) -> dict:
     """To samo przez OpenAI (Responses API, input_image jako data URL)."""
+    if meta is not None:
+        meta["aiProvider"] = "openai"
+        meta["aiModel"] = OPENAI_MODEL
     client = get_openai_client()
     content = [{"type": "input_text", "text": prompt}]
     for image_bytes, mime in images:
@@ -1313,10 +1339,16 @@ def build_kalorie_chat_prompt(req: KalorieChatRequest, attachments_section: str 
         context_section = f"""
 Dane z aplikacji Licznik Kalorii (kontekst - traktuj jako ZRODLO PRAWDY
 o uzytkowniku; zawiera: dzisiejsze posilki i sumy, cele dzienne kcal i makro,
-srednie oraz trendy z ostatnich 7 i 30 dni, nawodnienie, wage i sklad ciala
-z Trainera, cel sylwetki i strategie, rozmiary wlasnych baz produktow,
-skladnikow i przepisow):
+AKTYWNOSC DNIA z Trainera (pole "aktywnoscZTrainera": spalone kalorie
+z treningu/biegu/krokow, kroki, minuty), srednie oraz trendy z ostatnich 7
+i 30 dni, nawodnienie, wage i sklad ciala z Trainera, cel sylwetki
+i strategie, rozmiary wlasnych baz produktow, skladnikow i przepisow):
 {json.dumps(req.context, ensure_ascii=False)}
+
+WAZNE o aktywnosci: gdy "aktywnoscZTrainera.dostepna" = true, kalorie spalone
+aktywnoscia SA JUZ wliczone w "celeDzienne.kcal" (cel bazowy + sport) oraz
+w "zostaloDzisKcal". Nie mow, ze liczysz bez aktywnosci ani o zerze
+kalorycznym bez Trainera - dane sa w kontekscie, uzyj ich.
 """
 
     instructions_section = ""
@@ -1349,23 +1381,75 @@ Zwroc WYLACZNIE JSON w formacie:
 """
 
 
+# Silnik czatu ma WLASNY lancuch providerow, niezalezny od AI_PROVIDER
+# uzywanego przez analizy. Domyslnie: najpierw Gemini (darmowa pula, rotacja
+# 4 kluczy i modeli), a dopiero gdy CALA ta rotacja padnie — OpenAI. Dzieki
+# temu quota GPT idzie wylacznie na rozmowy, ktorych Gemini nie obsluzyl.
+CHAT_AI_PROVIDER = os.environ.get("CHAT_AI_PROVIDER", "gemini_then_openai").strip().lower()
+
+
+async def _chat_via_gemini(prompt: str, images, meta: Dict[str, Any]) -> dict:
+    if images:
+        return await asyncio.to_thread(generate_text_json_with_images, prompt, images, meta)
+    return await asyncio.to_thread(generate_text_json, prompt, meta)
+
+
+async def _chat_via_openai(prompt: str, images, meta: Dict[str, Any]) -> dict:
+    if images:
+        return await asyncio.to_thread(generate_openai_text_json_with_images, prompt, images, meta)
+    return await asyncio.to_thread(generate_openai_text_json, prompt, meta)
+
+
+async def generate_chat_json(
+    prompt: str,
+    provider: Optional[str],
+    images,
+    meta: Dict[str, Any],
+) -> dict:
+    """Odpowiedz czatu wedlug wybranego lancucha providerow.
+
+    'gemini' / 'openai' — jeden silnik. 'gemini_then_openai' (domyslne) i
+    'openai_then_gemini' — z przelaczeniem, gdy pierwszy odmowi (limit, quota,
+    przeciazenie, blad modelu)."""
+    selected = (provider or CHAT_AI_PROVIDER or "gemini_then_openai").strip().lower()
+
+    if selected in ("openai", "gpt"):
+        return await _chat_via_openai(prompt, images, meta)
+    if selected == "gemini":
+        return await _chat_via_gemini(prompt, images, meta)
+
+    if selected == "openai_then_gemini":
+        try:
+            return await _chat_via_openai(prompt, images, meta)
+        except Exception as error:
+            print("OPENAI CHAT PADL, PROBUJE GEMINI:", error)
+            meta["fallbackFrom"] = "openai"
+            return await _chat_via_gemini(prompt, images, meta)
+
+    # Domyslnie: Gemini, a GPT jako zapas.
+    try:
+        return await _chat_via_gemini(prompt, images, meta)
+    except Exception as error:
+        print("GEMINI CHAT PADL, PROBUJE OPENAI:", error)
+        if not OPENAI_API_KEY:
+            raise
+        meta["fallbackFrom"] = "gemini"
+        return await _chat_via_openai(prompt, images, meta)
+
+
 @app.post("/chat")
 @app.post("/ai/chat")
 async def kalorie_chat(req: KalorieChatRequest):
     try:
         attachments_section, images = split_chat_attachments(req.attachments)
         prompt = build_kalorie_chat_prompt(req, attachments_section)
-        selected = (req.ai_provider or req.provider or AI_PROVIDER).strip().lower()
-        if selected in ("openai", "gpt"):
-            if images:
-                raw = await asyncio.to_thread(generate_openai_text_json_with_images, prompt, images)
-            else:
-                raw = await asyncio.to_thread(generate_openai_text_json, prompt)
-        else:
-            if images:
-                raw = await asyncio.to_thread(generate_text_json_with_images, prompt, images)
-            else:
-                raw = await asyncio.to_thread(generate_text_json, prompt)
+        meta: Dict[str, Any] = {}
+        raw = await generate_chat_json(
+            prompt,
+            req.ai_provider or req.provider,
+            images,
+            meta,
+        )
         reply = str(
             raw.get("reply")
             or raw.get("message")
@@ -1373,7 +1457,14 @@ async def kalorie_chat(req: KalorieChatRequest):
             or raw.get("answer")
             or "Nie udalo sie przygotowac odpowiedzi."
         )
-        return {"reply": reply}
+        return {
+            "reply": reply,
+            "aiProvider": meta.get("aiProvider", ""),
+            "aiModel": meta.get("aiModel", ""),
+            # Ustawione tylko wtedy, gdy pierwszy silnik odmowil — aplikacja
+            # moze o tym powiedziec zamiast po cichu zmieniac jakosc odpowiedzi.
+            "fallbackFrom": meta.get("fallbackFrom", ""),
+        }
     except Exception as error:
         error_text = str(error)
         print("BLAD KALORIE CHAT:", error_text)
