@@ -5,3 +5,5 @@ google-genai
 pydantic
 openai
 requests
+# Render eMudhra advisory: HTTP clients must use a patched CA bundle.
+certifi>=2026.10.19
